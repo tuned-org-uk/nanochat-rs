@@ -1,0 +1,77 @@
+[package]
+name = "nanochat-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Nanochat in Rust"
+authors = ["Lorenzo <tunedconsulting@gmail.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/tuned-org-uk/nanochat-rs"
+homepage = "https://github.com/tuned-org-uk/nanochat-rs"
+documentation = "https://docs.rs/nanochat-rs"
+readme = "README.md"
+keywords = ["embeddings", "gpt", "llm"]
+categories = ["algorithms", "mathematics", "science"]
+exclude = [
+    "target/*",
+    "Cargo.lock",
+    ".git/*",
+    ".github/*",
+    "*.tmp",
+    "*.md",
+    "*.bib",
+    "*.cff",
+    "test_data/*",
+    "examples/*"
+]
+[dependencies]
+# Burn with default CPU + optional GPU backends
+burn = { version = "0.18.0", default-features = false, features = ["std", "train"] }
+burn-ndarray = { version = "0.18.0", optional = true }
+burn-wgpu = { version = "0.18.0", optional = true }
+burn-cuda = { version = "0.18.0", optional = true }
+
+# Core dependencies
+#bincode = "2.0.0"
+ndarray = { version = "0.16.1", optional = true }
+#image = "0.25"
+#imageproc = "0.25"
+#ab_glyph = "0.2"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0" }
+tokenizers = "0.22.1"
+env_logger = "0.11.8"
+log = "0.4.28"
+
+
+
+[features]
+default = ["cpu"]
+cpu = ["burn-ndarray", "ndarray"]
+wgpu = ["burn-wgpu"]
+cuda = ["burn-cuda"]
+
+# Convenience feature for all backends
+all-backends = ["cpu", "wgpu", "cuda"]
+
+[lib]
+name = "nanochat"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "nanochat"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 1  # Faster dev builds
+
+[workspace]
+rustbpe = "rustbpe/"
+
+
