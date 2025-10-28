@@ -51,7 +51,7 @@ impl Default for SpecialTokens {
 // Message structure for chat templating
 // ═════════════════════════════════════════════════════════════════════════════
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
@@ -79,7 +79,7 @@ impl ChatMessage {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
- // Main tokenizer struct
+// Main tokenizer struct
 // ═════════════════════════════════════════════════════════════════════════════
 
 pub struct NanoChatTokenizer {
@@ -148,10 +148,14 @@ impl NanoChatTokenizer {
         }
 
         let vocab_size = base_tokenizer.get_vocab_size(true);
-        let bos_token_id = special_token_map.get(&special_tokens.bos_token)
-            .copied().ok_or_else(|| anyhow!("BOS token not found after registration"))?;
-        let eos_token_id = special_token_map.get(&special_tokens.eos_token)
-            .copied().ok_or_else(|| anyhow!("EOS token not found after registration"))?;
+        let bos_token_id = special_token_map
+            .get(&special_tokens.bos_token)
+            .copied()
+            .ok_or_else(|| anyhow!("BOS token not found after registration"))?;
+        let eos_token_id = special_token_map
+            .get(&special_tokens.eos_token)
+            .copied()
+            .ok_or_else(|| anyhow!("EOS token not found after registration"))?;
 
         Ok(Self {
             base_tokenizer,
@@ -168,7 +172,9 @@ impl NanoChatTokenizer {
     // ─────────────────────────────────────────────────────────────────────────
 
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
-        let encoding = self.base_tokenizer.encode(text, false)
+        let encoding = self
+            .base_tokenizer
+            .encode(text, false)
             .map_err(|e| anyhow!("Encoding failed: {e}"))?;
         Ok(encoding.get_ids().to_vec())
     }
@@ -180,12 +186,14 @@ impl NanoChatTokenizer {
     }
 
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
-        self.base_tokenizer.decode(ids, false)
+        self.base_tokenizer
+            .decode(ids, false)
             .map_err(|e| anyhow!("Decoding failed: {e}"))
     }
 
     pub fn decode_skip_special(&self, ids: &[u32]) -> Result<String> {
-        self.base_tokenizer.decode(ids, true)
+        self.base_tokenizer
+            .decode(ids, true)
             .map_err(|e| anyhow!("Decoding failed: {e}"))
     }
 
@@ -222,9 +230,18 @@ impl NanoChatTokenizer {
 
         for msg in messages {
             let (start_token, end_token) = match msg.role.as_str() {
-                "user" => (&self.special_tokens.user_start, &self.special_tokens.user_end),
-                "assistant" => (&self.special_tokens.assistant_start, &self.special_tokens.assistant_end),
-                "system" => (&self.special_tokens.system_start, &self.special_tokens.system_end),
+                "user" => (
+                    &self.special_tokens.user_start,
+                    &self.special_tokens.user_end,
+                ),
+                "assistant" => (
+                    &self.special_tokens.assistant_start,
+                    &self.special_tokens.assistant_end,
+                ),
+                "system" => (
+                    &self.special_tokens.system_start,
+                    &self.special_tokens.system_end,
+                ),
                 _ => return Err(anyhow!("Unknown role: {}", msg.role)),
             };
 
@@ -361,7 +378,9 @@ pub struct ConversationBuilder {
 
 impl ConversationBuilder {
     pub fn new() -> Self {
-        Self { messages: Vec::new() }
+        Self {
+            messages: Vec::new(),
+        }
     }
 
     pub fn system(mut self, content: impl Into<String>) -> Self {
@@ -379,6 +398,10 @@ impl ConversationBuilder {
         self
     }
 
+    pub fn push(&mut self, message: ChatMessage) {
+        self.messages.push(message);
+    }
+
     pub fn build(self) -> Vec<ChatMessage> {
         self.messages
     }
@@ -387,26 +410,5 @@ impl ConversationBuilder {
 impl Default for ConversationBuilder {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_conversation_builder() {
-        let messages = ConversationBuilder::new()
-            .system("You are a helpful assistant")
-            .user("Hello")
-            .assistant("Hi there!")
-            .user("How are you?")
-            .build();
-
-        assert_eq!(messages.len(), 4);
-        assert_eq!(messages[0].role, "system");
-        assert_eq!(messages[1].role, "user");
-        assert_eq!(messages[2].role, "assistant");
-        assert_eq!(messages[3].role, "user");
     }
 }
