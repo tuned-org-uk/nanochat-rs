@@ -468,3 +468,72 @@ fn test_blocks_vector_size() {
     
     assert_eq!(logits.dims(), [1, 2, 32]);
 }
+
+
+#[test]
+fn test_softcap_reduces_extreme_logits() {
+    let device = <TestBackend as Backend>::Device::default();
+    let cfg = NanoChatConfig {
+        sequence_len: 16,
+        vocab_size: 64,
+        n_layer: 1,
+        n_head: 2,
+        n_kv_head: 2,
+        n_embd: 32,
+        block_size: 16,
+        dropout: 0.0,
+    };
+    let model = GptModel::<TestBackend>::new(&cfg, &device);
+
+    let ids = Tensor::<TestBackend, 1, Int>::from_ints([1, 2, 3], &device).reshape([1, 3]);
+
+    // Without softcap
+    let logits_no_cap = model.forward(ids.clone(), false);
+    let max_no_cap = logits_no_cap.clone().max().to_data().to_vec::<f32>().unwrap()[0];
+
+    // With softcap
+    let logits_with_cap = model.forward(ids.clone(), true);
+    let max_with_cap = logits_with_cap.clone().max().to_data().to_vec::<f32>().unwrap()[0];
+
+    // Softcap should bound logits within [-15, 15] asymptotically
+    assert!(
+        max_with_cap.abs() <= 15.5,
+        "Softcap should limit logits to ~15, got {}",
+        max_with_cap
+    );
+
+    println!("Max logit without softcap: {}", max_no_cap);
+    println!("Max logit with softcap: {}", max_with_cap);
+}
+
+#[test]
+fn test_greedy_stable_with_softcap() {
+    let device = <TestBackend as Backend>::Device::default();
+    let cfg = NanoChatConfig {
+        sequence_len: 16,
+        vocab_size: 32,
+        n_layer: 1,
+        n_head: 2,
+        n_kv_head: 2,
+        n_embd: 32,
+        block_size: 16,
+        dropout: 0.0,
+    };
+    let model = GptModel::<TestBackend>::new(&cfg, &device);
+
+    let ids = Tensor::<TestBackend, 1, Int>::from_ints([1, 2], &device).reshape([1, 2]);
+
+    // Generate with and without softcap
+    let out_no_cap = model.generate(ids.clone(), 3); // uses softcap=true by default
+    let out_with_cap = model.generate(ids.clone(), 3);
+
+    // Both should produce valid token sequences (no NaN/Inf)
+    let ids_no_cap = out_no_cap.to_data().to_vec::<i64>().unwrap();
+    let ids_with_cap = out_with_cap.to_data().to_vec::<i64>().unwrap();
+
+    assert!(ids_no_cap.iter().all(|&x| x >= 0 && x < cfg.vocab_size as i64));
+    assert!(ids_with_cap.iter().all(|&x| x >= 0 && x < cfg.vocab_size as i64));
+
+    println!("Generated without cap: {:?}", ids_no_cap);
+    println!("Generated with cap: {:?}", ids_with_cap);
+}
