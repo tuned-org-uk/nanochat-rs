@@ -3,6 +3,7 @@
 // Tests
 // ═════════════════════════════════════════════════════════════════════════════
 
+use crate::tokenizer::*;
 
 // Helper to create a minimal test tokenizer
 fn create_test_tokenizer() -> NanoChatTokenizer {

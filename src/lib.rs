@@ -10,6 +10,8 @@ pub mod backend;
 pub mod config;
 pub mod gpt;
 pub mod tokenizer;
+pub mod sampling;
+pub mod engine;
 
 #[cfg(test)]
 mod tests;
