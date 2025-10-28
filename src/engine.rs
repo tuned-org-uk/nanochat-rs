@@ -92,7 +92,7 @@ pub struct Engine<B: Backend> {
 impl<B: Backend> Engine<B> {
     pub fn new(model: GptModel<B>, device: B::Device) -> Self {
         info!("Engine: new with {} layers", model.num_layers());
-        Self { model, device }
+        Self { model, _device: device }
     }
 
     // Prefill runs full forward once to compute logits (no cache used).

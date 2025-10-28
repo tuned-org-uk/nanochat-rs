@@ -16,6 +16,29 @@ use log::{debug, info, trace};
 
 use crate::config::NanoChatConfig;
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RMS norm
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Functional RMSNorm (no learnable params), over last dimension
+fn rms_norm<B: Backend, const D: usize>(x: Tensor<B, D>, eps: f32) -> Tensor<B, D> {
+    let dims = x.dims();
+    let last = dims.len() - 1;
+
+    // mean of squares over last dim
+    let ms = x.clone().powf_scalar(2.0).mean_dim(last);
+    let rms = (ms + eps).sqrt();
+
+    // broadcast back to input shape
+    let mut bshape = dims.clone();
+    bshape[last] = 1;
+    let rms_b = rms.reshape(bshape).expand(dims);
+
+    x / rms_b
+}
+
+
 // ─────────────────────────────────────────────────────────────────────────────
 // RoPE
 // ─────────────────────────────────────────────────────────────────────────────
@@ -201,9 +224,9 @@ impl<B: Backend> CausalSelfAttention<B> {
         debug!("Layer {} after RoPE: Q {:?}, K {:?}", self.layer_idx, q.dims(), k.dims());
 
         // QK-norm via LayerNorm over D
-        let q = self.norm_heads(q, &self.qk_norm_q);
-        let k = self.norm_heads(k, &self.qk_norm_k);
-        debug!("Layer {} after QK-norm", self.layer_idx);
+        let q = rms_norm(q, 1e-6);
+        let k = rms_norm(k, 1e-6);
+        debug!("Layer {} after RMS-norm", self.layer_idx);
 
         // Attention
         let y = self.scaled_dot_product_attention(q, k, v, t, t);
@@ -247,7 +270,7 @@ impl<B: Backend> CausalSelfAttention<B> {
         // MQA repeat if needed
         let (k, v) = if self.n_head != self.n_kv_head {
             let repeat = self.n_head / self.n_kv_head;
-            debug!(
+            trace!(
                 "Attn(L{}): MQA expand KV heads: H_kv={} -> H_q={} (repeat x{})",
                 self.layer_idx, self.n_kv_head, self.n_head, repeat
             );
@@ -355,8 +378,8 @@ impl<B: Backend> CausalSelfAttention<B> {
             cos_step.dims(),
             sin_step.dims()
         );
-        let q = apply_rotary_emb(q, cos_step.clone(), sin_step.clone());
-        let k_new = apply_rotary_emb(k_new, cos_step.clone(), sin_step.clone());
+        let q = rms_norm(q, 1e-6);
+        let k_new = rms_norm(k_new, 1e-6);
 
         // QK norm via LayerNorm over D
         let q = self.norm_heads(q, &self.qk_norm_q);
@@ -475,9 +498,9 @@ impl<B: Backend> Block<B> {
         x: Tensor<B, 3>,
         cos_sin: (&Tensor<B, 4>, &Tensor<B, 4>),
     ) -> Tensor<B, 3> {
-        debug!("Block {} forward: input shape {:?}", self.layer_idx, x.dims());
-        let x = x.clone() + self.attn.forward(self.ln1.forward(x.clone()), cos_sin);
-        x.clone() + self.mlp.forward(self.ln2.forward(x))
+        // Pre-norm via RMSNorm instead of LayerNorm (ln1 is retained but unused)
+        let x = x.clone() + self.attn.forward(rms_norm(x.clone(), 1e-6), cos_sin);
+        x.clone() + self.mlp.forward(rms_norm(x, 1e-6))
     }
 
     pub fn forward_decode(
@@ -486,10 +509,12 @@ impl<B: Backend> Block<B> {
         cos_sin_step: (&Tensor<B, 4>, &Tensor<B, 4>), // [1,1,1,D/2]
         cache_layer: &mut Option<(Tensor<B, 4>, Tensor<B, 4>)>,
     ) -> Tensor<B, 3> {
-        let x = x_step.clone() + self
-            .attn
-            .forward_decode(self.ln1.forward(x_step.clone()), cos_sin_step, cache_layer);
-        x.clone() + self.mlp.forward(self.ln2.forward(x))
+        let x = x_step.clone() + self.attn.forward_decode(
+            rms_norm(x_step.clone(), 1e-6),
+            cos_sin_step,
+            cache_layer,
+        );
+        x.clone() + self.mlp.forward(rms_norm(x, 1e-6))
     }
 }
 
@@ -574,8 +599,8 @@ impl<B: Backend> GptModel<B> {
         }
 
         // Final norm
-        x = self.ln_f.forward(x);
-        debug!("After final LayerNorm: shape {:?}", x.dims());
+        x = rms_norm(x, 1e-6);
+        debug!("After final RMS norm: shape {:?}", x.dims());
 
         // Head → logits
         let mut logits = self.lm_head.forward(x);
@@ -673,8 +698,9 @@ impl<B: Backend> GptModel<B> {
             x = block.forward_decode(x, (&cos_step, &sin_step), layer_cache);
         }
 
-        // Final LayerNorm and head
-        x = self.ln_f.forward(x);
+        // Final LayerNorm -> RMSNorm
+        x = rms_norm(x, 1e-6);
+
         let mut logits = self.lm_head.forward(x);
 
         // Stability clamps and optional softcap
