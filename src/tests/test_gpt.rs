@@ -60,7 +60,7 @@ fn tiny_config() -> NanoChatConfig {
 fn test_model_construction() {
     let cfg = test_config();
     let device = Default::default();
-    let model = GptModel::<TestBackend>::new(&cfg, &device);
+    let _model = GptModel::<TestBackend>::new(&cfg, &device);
 
     // Just ensure it constructs without panic
     assert_eq!(cfg.vocab_size, 64);
@@ -87,7 +87,7 @@ fn test_forward_shape() {
     let input: Tensor<TestBackend, 1, Int> = Tensor::from_ints(input_data.as_slice(), &device);
     let input = input.reshape([batch, seq_len]);
 
-    let logits = model.forward(input);
+    let logits = model.forward(input, true);
     let shape = logits.dims();
 
     assert_eq!(shape, [batch, seq_len, cfg.vocab_size]);
@@ -106,7 +106,7 @@ fn test_single_token_forward() {
     let input: Tensor<TestBackend, 1, Int> = Tensor::from_ints([1], &device);
     let input = input.reshape([1, 1]);
 
-    let logits = model.forward(input);
+    let logits = model.forward(input, true);
     assert_eq!(logits.dims(), [1, 1, cfg.vocab_size]);
 }
 
@@ -195,7 +195,7 @@ fn test_multi_batch_forward() {
     let input: Tensor<TestBackend, 1, Int> = Tensor::from_ints(data.as_slice(), &device);
     let input = input.reshape([batch, seq_len]);
 
-    let logits = model.forward(input);
+    let logits = model.forward(input, true);
     assert_eq!(logits.dims(), [batch, seq_len, cfg.vocab_size]);
 
     // Check that no NaNs or Infs in logits (basic sanity)
@@ -211,6 +211,7 @@ fn test_multi_batch_forward() {
 
 #[test]
 fn test_attention_mask_causal() {
+    crate::init();
     // This is an indirect test: we check that generation at position t
     // doesn't depend on tokens at positions > t by verifying that
     // greedy generation is consistent when we truncate future tokens.
@@ -224,14 +225,14 @@ fn test_attention_mask_causal() {
     let input = input.reshape([1, seed.len()]);
 
     // Forward on full sequence
-    let logits_full = model.forward(input.clone());
+    let logits_full = model.forward_no_softcap(input.clone());
     let last_full = logits_full.slice([0..1, (seed.len() - 1)..seed.len(), 0..cfg.vocab_size]);
     let tok_full = last_full.reshape([1, cfg.vocab_size]).argmax(1);
 
     // Forward on prefix (should give same logit at last prefix position)
     let prefix_len = seed.len() - 1;
     let input_prefix = input.slice([0..1, 0..prefix_len]);
-    let logits_prefix = model.forward(input_prefix);
+    let logits_prefix = model.forward_no_softcap(input_prefix);
     let last_prefix = logits_prefix.slice([0..1, (prefix_len - 1)..prefix_len, 0..cfg.vocab_size]);
     let tok_prefix = last_prefix.reshape([1, cfg.vocab_size]).argmax(1);
 
@@ -260,7 +261,7 @@ fn test_zero_length_input() {
 
     // Create empty input (should panic or error)
     let input: Tensor<TestBackend, 2, Int> = Tensor::zeros([1, 0], &device);
-    let _ = model.forward(input);
+    let _ = model.forward(input, true);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -280,7 +281,7 @@ fn test_large_batch() {
     let input: Tensor<TestBackend, 1, Int> = Tensor::from_ints(data.as_slice(), &device);
     let input = input.reshape([batch, seq_len]);
 
-    let logits = model.forward(input);
+    let logits = model.forward(input, true);
     assert_eq!(logits.dims(), [batch, seq_len, cfg.vocab_size]);
 }
 
@@ -300,7 +301,7 @@ fn test_different_head_counts() {
     let input: Tensor<TestBackend, 1, Int> = Tensor::from_ints([0, 1, 2], &device);
     let input = input.reshape([1, 3]);
 
-    let logits = model.forward(input);
+    let logits = model.forward(input, true);
     assert_eq!(logits.dims(), [1, 3, cfg.vocab_size]);
 }
 
@@ -333,7 +334,7 @@ fn test_numerical_stability() {
         .reshape([1, 4]);
     debug!("input {:?}", input);
 
-    let logits = model.forward(input);
+    let logits = model.forward_no_softcap(input);
     debug!("logits {:?}", logits);
     
     // Check health

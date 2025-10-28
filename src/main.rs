@@ -38,7 +38,7 @@ fn main() -> Result<()> {
     let input = input.reshape([1, seed_tokens.len()]); // [B=1, T=4]
 
     // 5) Forward once to check shapes
-    let logits = model.forward(input.clone()); // [1, 4, vocab]
+    let logits = model.forward(input.clone(), true); // [1, 4, vocab]
     let shape = logits.dims();
     println!("Forward OK. Logits shape = {:?}", shape);
 
