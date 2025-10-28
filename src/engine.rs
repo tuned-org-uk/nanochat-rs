@@ -139,6 +139,22 @@ impl<B: Backend> Engine<B> {
             finished: false,
         }
     }
+
+    pub fn decode_next_with_policy(
+        &self,
+        last_id: Tensor<B, 2, Int>,
+        cache: &mut KVCache<B>,
+        policy: crate::sampling::SamplingPolicy,
+    ) -> (Tensor<B, 2, Int>, Tensor<B, 3>) {
+        let logits_step = self.decode_next(last_id.clone(), cache); // [B,1,V]
+        let [b, _, v] = logits_step.dims();
+        let next = crate::sampling::sample_with_policy(
+            logits_step.clone().reshape([b, v]),
+            policy,
+        )
+        .reshape([b, 1]);
+        (next, logits_step)
+    }
 }
 
 // Streaming iterator that yields one token id [B,1] each step.

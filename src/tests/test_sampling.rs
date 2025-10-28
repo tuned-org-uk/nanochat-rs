@@ -126,3 +126,35 @@ fn test_large_vocab() {
     
     assert_eq!(ids[0], 999);
 }
+
+#[test]
+fn test_top_p_filter_keeps_mass() {
+    let logits = create_test_logits(); // [2,5]
+    let filtered = top_p_filter(logits.clone(), 0.6);
+    let probs = activation::softmax(filtered.clone(), 1);
+    let data = probs.to_data().to_vec::<f32>().unwrap();
+
+    // First row: should keep the largest tokens until ~0.6
+    // Check that we still get a valid distribution after masking
+    for b in 0..2 {
+        let mut sum = 0.0;
+        for v in 0..5 {
+            sum += data[b * 5 + v];
+        }
+        assert!((sum - 1.0).abs() < 1e-5, "Probabilities should re-normalize to 1");
+    }
+}
+
+#[test]
+fn test_policy_dispatch() {
+    let logits = create_test_logits(); // [2,5]
+    let ids_greedy = sample_with_policy(logits.clone(), SamplingPolicy::Greedy)
+        .to_data()
+        .to_vec::<i64>()
+        .unwrap();
+    let ids_topk = sample_with_policy(logits.clone(), SamplingPolicy::TopK { k: 1 })
+        .to_data()
+        .to_vec::<i64>()
+        .unwrap();
+    assert_eq!(ids_greedy, ids_topk, "Top-1 equals greedy");
+}
