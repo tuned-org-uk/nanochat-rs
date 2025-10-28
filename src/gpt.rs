@@ -12,7 +12,7 @@ use burn::{
     nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig},
     tensor::{activation, backend::Backend, Bool, Int, Tensor},
 };
-use log::{debug, info};
+use log::{debug, info, trace};
 
 use crate::config::NanoChatConfig;
 
@@ -232,37 +232,75 @@ impl<B: Backend> CausalSelfAttention<B> {
         let [b, _hq, _tq, d] = q.dims();
         let h_kv = k.dims()[1];
 
+        debug!(
+            "Attn(L{}): q {:?}, k {:?}, v {:?}, Tq={}, Tk={}, D={}, H_kv={}",
+            self.layer_idx,
+            q.dims(),
+            k.dims(),
+            v.dims(),
+            t_q,
+            t_k,
+            d,
+            h_kv
+        );
+
         // MQA repeat if needed
         let (k, v) = if self.n_head != self.n_kv_head {
             let repeat = self.n_head / self.n_kv_head;
+            debug!(
+                "Attn(L{}): MQA expand KV heads: H_kv={} -> H_q={} (repeat x{})",
+                self.layer_idx, self.n_kv_head, self.n_head, repeat
+            );
             let k5: Tensor<B, 5> = k.unsqueeze_dim::<5>(2);
-            let k = k5.expand([b, h_kv, repeat, t_k, d]).reshape([b, self.n_head, t_k, d]);
+            let k = k5
+                .expand([b, h_kv, repeat, t_k, d])
+                .reshape([b, self.n_head, t_k, d]);
             let v5: Tensor<B, 5> = v.unsqueeze_dim::<5>(2);
-            let v = v5.expand([b, h_kv, repeat, t_k, d]).reshape([b, self.n_head, t_k, d]);
+            let v = v5
+                .expand([b, h_kv, repeat, t_k, d])
+                .reshape([b, self.n_head, t_k, d]);
             (k, v)
         } else {
             (k, v)
         };
 
+        trace!(
+            "Attn(L{}): after MQA (if any): k {:?}, v {:?}",
+            self.layer_idx,
+            k.dims(),
+            v.dims()
+        );
+
         // Compute raw attention scores
         let scale = (d as f32).sqrt();
-        let mut att = q.matmul(k.swap_dims(2, 3)) / scale;   // [B, H, Tq, Tk]
+        let mut att = q.matmul(k.swap_dims(2, 3)) / scale; // [B, H, Tq, Tk]
+        trace!("Attn(L{}): raw att {:?}", self.layer_idx, att.dims());
 
         // 1) Apply causal mask FIRST with large negative
         let mask2: Tensor<B, 2, Bool> = Tensor::tril_mask([t_q, t_k], 0, &att.device());
-        let mask4 = mask2.unsqueeze_dims::<4>(&[0, 1]).expand([b, self.n_head, t_q, t_k]);
+        let mask4 = mask2
+            .unsqueeze_dims::<4>(&[0, 1])
+            .expand([b, self.n_head, t_q, t_k]);
         att = att.mask_fill(mask4.bool_not(), -1.0e9);
+        trace!("Attn(L{}): mask applied (causal)", self.layer_idx);
 
         // 2) Subtract per-row max along keys axis (dimension 3)
-        // max_dim(3) returns [B, H, Tq, 1]; squeeze to [B, H, Tq], then unsqueeze back
-        let att_max = att.clone().max_dim(3).squeeze::<3>(3);        // [B, H, Tq]
-        att = att - att_max.unsqueeze_dim::<4>(3);                   // [B, H, Tq, Tk]
+        let att_max = att.clone().max_dim(3).squeeze::<3>(3); // [B, H, Tq]
+        att = att - att_max.unsqueeze_dim::<4>(3); // [B, H, Tq, Tk]
+        trace!("Attn(L{}): stabilized by row max subtraction", self.layer_idx);
 
-        // 3) Softmax
+        // 3) Softmax over keys axis
         let att = activation::softmax(att, 3);
+        trace!("Attn(L{}): softmax done on axis=3", self.layer_idx);
 
         // 4) Weighted sum
-        att.matmul(v)  // [B, H, Tq, D]
+        let out = att.matmul(v); // [B, H, Tq, D]
+        debug!(
+            "Attn(L{}): output shape {:?}",
+            self.layer_idx,
+            out.dims()
+        );
+        out
     }
 
     // Decode-time forward: Tq = 1, appends K/V to cache for this layer and attends to full past.
@@ -274,6 +312,10 @@ impl<B: Backend> CausalSelfAttention<B> {
     ) -> Tensor<B, 3> {
         let [b, tq, c] = x_step.dims();
         debug_assert_eq!(tq, 1, "forward_decode expects T=1 input");
+        debug!(
+            "Layer {} decode: x_step shape [B={}, T={}, C={}]",
+            self.layer_idx, b, tq, c
+        );
 
         // Project Q,K,V then reshape
         let q = self
@@ -297,24 +339,51 @@ impl<B: Backend> CausalSelfAttention<B> {
             .reshape([b, 1, self.n_kv_head, self.head_dim])
             .swap_dims(1, 2); // [B, Hkv, 1, D]
 
+        debug!(
+            "Layer {} decode: Q/K/V step shapes -> Q {:?}, K_new {:?}, V_new {:?}",
+            self.layer_idx,
+            q.dims(),
+            k_new.dims(),
+            v_new.dims()
+        );
+
         // Apply RoPE to Q and to K_new
         let (cos_step, sin_step) = cos_sin_step;
+        debug!(
+            "Layer {} decode: RoPE step cos/sin shapes: {:?} / {:?}",
+            self.layer_idx,
+            cos_step.dims(),
+            sin_step.dims()
+        );
         let q = apply_rotary_emb(q, cos_step.clone(), sin_step.clone());
         let k_new = apply_rotary_emb(k_new, cos_step.clone(), sin_step.clone());
 
         // QK norm via LayerNorm over D
         let q = self.norm_heads(q, &self.qk_norm_q);
         let k_new = self.norm_heads(k_new, &self.qk_norm_k);
+        debug!("Layer {} decode: after QK-norm", self.layer_idx);
 
         // Append new K,V into cache (time concat on dim=2)
         let (k_full, v_full): (Tensor<B, 4>, Tensor<B, 4>) = match cache_layer.take() {
             Some((k_all, v_all)) => {
-                // concat on time axis=2
+                let tk_prev = k_all.dims()[2];
                 let k_cat = Tensor::cat(vec![k_all, k_new.clone()], 2);
                 let v_cat = Tensor::cat(vec![v_all, v_new.clone()], 2);
+                debug!(
+                    "Layer {} decode: appended to cache (prev T={}, new T={})",
+                    self.layer_idx,
+                    tk_prev,
+                    tk_prev + 1
+                );
                 (k_cat, v_cat)
             }
-            None => (k_new.clone(), v_new.clone()),
+            None => {
+                debug!(
+                    "Layer {} decode: initializing cache (T becomes 1)",
+                    self.layer_idx
+                );
+                (k_new.clone(), v_new.clone())
+            }
         };
 
         // Store back into the cache layer
@@ -322,13 +391,22 @@ impl<B: Backend> CausalSelfAttention<B> {
 
         // Use full K,V from cache for attention
         let tk = k_full.dims()[2];
+        debug!(
+            "Layer {} decode: attention with Tq=1, Tk={}, heads_q={}, heads_kv={}",
+            self.layer_idx, tk, self.n_head, self.n_kv_head
+        );
         let y = self.scaled_dot_product_attention(q, k_full, v_full, 1, tk);
 
         // Merge heads to [B,1,C] then project
         let y = y.swap_dims(1, 2).reshape([b, 1, c]);
-        self.c_proj.forward(y)
+        let out = self.c_proj.forward(y);
+        debug!(
+            "Layer {} decode: output step shape {:?}",
+            self.layer_idx,
+            out.dims()
+        );
+        out
     }
-
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -520,7 +598,7 @@ impl<B: Backend> GptModel<B> {
     }
 
     pub fn generate(&self, mut idx: Tensor<B, 2, Int>, max_new_tokens: usize) -> Tensor<B, 2, Int> {
-        let [b, t0] = idx.dims();
+        let [_b, t0] = idx.dims();
         info!("Generation: initial_len={}, max_new={}", t0, max_new_tokens);
         
         for step in 0..max_new_tokens {
