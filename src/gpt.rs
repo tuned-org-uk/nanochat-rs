@@ -221,50 +221,113 @@ impl<B: Backend> CausalSelfAttention<B> {
         out.reshape([b, h, t, d])
     }
 
-fn scaled_dot_product_attention(
-    &self,
-    q: Tensor<B, 4>, // [B, H, Tq, D]
-    k: Tensor<B, 4>, // [B, H, Tk, D]
-    v: Tensor<B, 4>, // [B, H, Tk, D]
-    t_q: usize,
-    t_k: usize,
-) -> Tensor<B, 4> {
-    let [b, _hq, _tq, d] = q.dims();
-    let h_kv = k.dims()[1];
+    fn scaled_dot_product_attention(
+        &self,
+        q: Tensor<B, 4>, // [B, H, Tq, D]
+        k: Tensor<B, 4>, // [B, H, Tk, D]
+        v: Tensor<B, 4>, // [B, H, Tk, D]
+        t_q: usize,
+        t_k: usize,
+    ) -> Tensor<B, 4> {
+        let [b, _hq, _tq, d] = q.dims();
+        let h_kv = k.dims()[1];
 
-    // MQA repeat if needed
-    let (k, v) = if self.n_head != self.n_kv_head {
-        let repeat = self.n_head / self.n_kv_head;
-        let k5: Tensor<B, 5> = k.unsqueeze_dim::<5>(2);
-        let k = k5.expand([b, h_kv, repeat, t_k, d]).reshape([b, self.n_head, t_k, d]);
-        let v5: Tensor<B, 5> = v.unsqueeze_dim::<5>(2);
-        let v = v5.expand([b, h_kv, repeat, t_k, d]).reshape([b, self.n_head, t_k, d]);
-        (k, v)
-    } else {
-        (k, v)
-    };
+        // MQA repeat if needed
+        let (k, v) = if self.n_head != self.n_kv_head {
+            let repeat = self.n_head / self.n_kv_head;
+            let k5: Tensor<B, 5> = k.unsqueeze_dim::<5>(2);
+            let k = k5.expand([b, h_kv, repeat, t_k, d]).reshape([b, self.n_head, t_k, d]);
+            let v5: Tensor<B, 5> = v.unsqueeze_dim::<5>(2);
+            let v = v5.expand([b, h_kv, repeat, t_k, d]).reshape([b, self.n_head, t_k, d]);
+            (k, v)
+        } else {
+            (k, v)
+        };
 
-    // Compute raw attention scores
-    let scale = (d as f32).sqrt();
-    let mut att = q.matmul(k.swap_dims(2, 3)) / scale;   // [B, H, Tq, Tk]
+        // Compute raw attention scores
+        let scale = (d as f32).sqrt();
+        let mut att = q.matmul(k.swap_dims(2, 3)) / scale;   // [B, H, Tq, Tk]
 
-    // 1) Apply causal mask FIRST with large negative
-    let mask2: Tensor<B, 2, Bool> = Tensor::tril_mask([t_q, t_k], 0, &att.device());
-    let mask4 = mask2.unsqueeze_dims::<4>(&[0, 1]).expand([b, self.n_head, t_q, t_k]);
-    att = att.mask_fill(mask4.bool_not(), -1.0e9);
+        // 1) Apply causal mask FIRST with large negative
+        let mask2: Tensor<B, 2, Bool> = Tensor::tril_mask([t_q, t_k], 0, &att.device());
+        let mask4 = mask2.unsqueeze_dims::<4>(&[0, 1]).expand([b, self.n_head, t_q, t_k]);
+        att = att.mask_fill(mask4.bool_not(), -1.0e9);
 
-    // 2) Subtract per-row max along keys axis (dimension 3)
-    // max_dim(3) returns [B, H, Tq, 1]; squeeze to [B, H, Tq], then unsqueeze back
-    let att_max = att.clone().max_dim(3).squeeze::<3>(3);        // [B, H, Tq]
-    att = att - att_max.unsqueeze_dim::<4>(3);                   // [B, H, Tq, Tk]
+        // 2) Subtract per-row max along keys axis (dimension 3)
+        // max_dim(3) returns [B, H, Tq, 1]; squeeze to [B, H, Tq], then unsqueeze back
+        let att_max = att.clone().max_dim(3).squeeze::<3>(3);        // [B, H, Tq]
+        att = att - att_max.unsqueeze_dim::<4>(3);                   // [B, H, Tq, Tk]
 
-    // 3) Softmax
-    let att = activation::softmax(att, 3);
+        // 3) Softmax
+        let att = activation::softmax(att, 3);
 
-    // 4) Weighted sum
-    att.matmul(v)  // [B, H, Tq, D]
-}
+        // 4) Weighted sum
+        att.matmul(v)  // [B, H, Tq, D]
+    }
 
+    // Decode-time forward: Tq = 1, appends K/V to cache for this layer and attends to full past.
+    pub fn forward_decode(
+        &self,
+        x_step: Tensor<B, 3>,                         // [B, 1, C]
+        cos_sin_step: (&Tensor<B, 4>, &Tensor<B, 4>), // [1,1,1,D/2]
+        cache_layer: &mut Option<(Tensor<B, 4>, Tensor<B, 4>)>, // K/V store for this layer
+    ) -> Tensor<B, 3> {
+        let [b, tq, c] = x_step.dims();
+        debug_assert_eq!(tq, 1, "forward_decode expects T=1 input");
+
+        // Project Q,K,V then reshape
+        let q = self
+            .c_q
+            .forward(x_step.clone())
+            .clamp(-5.0, 5.0)
+            .reshape([b, 1, self.n_head, self.head_dim])
+            .swap_dims(1, 2); // [B, Hq, 1, D]
+
+        let k_new = self
+            .c_k
+            .forward(x_step.clone())
+            .clamp(-5.0, 5.0)
+            .reshape([b, 1, self.n_kv_head, self.head_dim])
+            .swap_dims(1, 2); // [B, Hkv, 1, D]
+
+        let v_new = self
+            .c_v
+            .forward(x_step)
+            .clamp(-5.0, 5.0)
+            .reshape([b, 1, self.n_kv_head, self.head_dim])
+            .swap_dims(1, 2); // [B, Hkv, 1, D]
+
+        // Apply RoPE to Q and to K_new
+        let (cos_step, sin_step) = cos_sin_step;
+        let q = apply_rotary_emb(q, cos_step.clone(), sin_step.clone());
+        let k_new = apply_rotary_emb(k_new, cos_step.clone(), sin_step.clone());
+
+        // QK norm via LayerNorm over D
+        let q = self.norm_heads(q, &self.qk_norm_q);
+        let k_new = self.norm_heads(k_new, &self.qk_norm_k);
+
+        // Append new K,V into cache (time concat on dim=2)
+        let (k_full, v_full): (Tensor<B, 4>, Tensor<B, 4>) = match cache_layer.take() {
+            Some((k_all, v_all)) => {
+                // concat on time axis=2
+                let k_cat = Tensor::cat(vec![k_all, k_new.clone()], 2);
+                let v_cat = Tensor::cat(vec![v_all, v_new.clone()], 2);
+                (k_cat, v_cat)
+            }
+            None => (k_new.clone(), v_new.clone()),
+        };
+
+        // Store back into the cache layer
+        *cache_layer = Some((k_full.clone(), v_full.clone()));
+
+        // Use full K,V from cache for attention
+        let tk = k_full.dims()[2];
+        let y = self.scaled_dot_product_attention(q, k_full, v_full, 1, tk);
+
+        // Merge heads to [B,1,C] then project
+        let y = y.swap_dims(1, 2).reshape([b, 1, c]);
+        self.c_proj.forward(y)
+    }
 
 }
 
@@ -338,6 +401,18 @@ impl<B: Backend> Block<B> {
         let x = x.clone() + self.attn.forward(self.ln1.forward(x.clone()), cos_sin);
         x.clone() + self.mlp.forward(self.ln2.forward(x))
     }
+
+    pub fn forward_decode(
+        &self,
+        x_step: Tensor<B, 3>,                         // [B,1,C]
+        cos_sin_step: (&Tensor<B, 4>, &Tensor<B, 4>), // [1,1,1,D/2]
+        cache_layer: &mut Option<(Tensor<B, 4>, Tensor<B, 4>)>,
+    ) -> Tensor<B, 3> {
+        let x = x_step.clone() + self
+            .attn
+            .forward_decode(self.ln1.forward(x_step.clone()), cos_sin_step, cache_layer);
+        x.clone() + self.mlp.forward(self.ln2.forward(x))
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -352,6 +427,7 @@ pub struct GptModel<B: Backend> {
     lm_head: Linear<B>,
     cos: Tensor<B, 4>,
     sin: Tensor<B, 4>,
+    n_embd: usize,
 }
 
 impl<B: Backend> GptModel<B> {
@@ -395,6 +471,7 @@ impl<B: Backend> GptModel<B> {
             lm_head,
             cos,
             sin,
+            n_embd: cfg.n_embd,
         }
     }
 
@@ -478,5 +555,58 @@ impl<B: Backend> GptModel<B> {
             debug!("⚠️  Logits contain NaN or Inf!");
         }
         is_healthy
+    }
+
+        // Number of blocks (for KVCache sizing)
+    pub fn num_layers(&self) -> usize {
+        self.blocks.len()
+    }
+
+    // Decode one step using KV cache: last_ids [B,1] -> logits [B,1,V]
+    pub fn forward_decode(
+        &self,
+        last_ids: Tensor<B, 2, Int>, // [B,1]
+        cache: &mut crate::engine::KVCache<B>,
+        use_softcap: bool,
+    ) -> Tensor<B, 3> {
+        let [b, tq] = last_ids.dims();
+        debug_assert_eq!(tq, 1);
+
+        // Determine current time position from cache
+        let t_pos = cache.position();
+
+        // Slice RoPE for current position: [1,1,1,D/2]
+        let head_dim = self.cos.dims()[3];
+        let cos_step = self
+            .cos
+            .clone()
+            .slice([0..1, t_pos..(t_pos + 1), 0..1, 0..head_dim]);
+        let sin_step = self
+            .sin
+            .clone()
+            .slice([0..1, t_pos..(t_pos + 1), 0..1, 0..head_dim]);
+
+        // Embed last token
+        let mut x = self.wte.forward(last_ids).reshape([b, 1, self.n_embd]);
+
+        // One-step through blocks with KV cache
+        for (i, block) in self.blocks.iter().enumerate() {
+            let layer_cache = &mut cache.store[i];
+            x = block.forward_decode(x, (&cos_step, &sin_step), layer_cache);
+        }
+
+        // Final LayerNorm and head
+        x = self.ln_f.forward(x);
+        let mut logits = self.lm_head.forward(x);
+
+        // Stability clamps and optional softcap
+        logits = logits.clamp(-50.0, 50.0);
+        if use_softcap {
+            let softcap = 15.0;
+            logits = logits.clone().div_scalar(softcap).tanh().mul_scalar(softcap);
+        }
+        logits = logits.clamp(-50.0, 50.0);
+
+        logits
     }
 }
