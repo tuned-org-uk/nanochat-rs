@@ -4,7 +4,7 @@
 
 use crate::sampling::*;
 use crate::backend::AutoBackend;
-use burn_ndarray::NdArray;
+use burn::prelude::Backend;
 use burn::tensor::{activation, Tensor};
     
 type TestBackend = AutoBackend;

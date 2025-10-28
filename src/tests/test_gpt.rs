@@ -13,6 +13,7 @@ use log::debug;
 use burn::{
     tensor::{Int, Tensor},
 };
+use burn::prelude::Backend;
 
 use crate::{
     backend::AutoBackend,
@@ -342,4 +343,128 @@ fn test_numerical_stability() {
         GptModel::check_logits_health(&logits),
         "Found NaN or Inf in logits with tiny config"
     );
+}
+
+#[test]
+fn test_smoke_generation_multi_blocks() {
+    let device = <TestBackend as Backend>::Device::default();
+    let cfg = NanoChatConfig {
+        sequence_len: 32,
+        vocab_size: 64,
+        n_layer: 3,
+        n_head: 4,
+        n_kv_head: 4,
+        n_embd: 64,
+        block_size: 32,
+        dropout: 0.0,
+    };
+    let model = GptModel::<TestBackend>::new(&cfg, &device);
+
+    let ids = Tensor::<TestBackend, 1, Int>::from_ints([1, 2, 3], &device).reshape([1, 3]);
+    let out = model.generate(ids, 5);
+    assert_eq!(out.dims(), [1, 8]);
+}
+
+#[test]
+fn test_multi_block_forward_shape() {
+    let device = <TestBackend as Backend>::Device::default();
+    let cfg = NanoChatConfig {
+        sequence_len: 32,
+        vocab_size: 128,
+        n_layer: 4,  // Multiple blocks
+        n_head: 4,
+        n_kv_head: 4,
+        n_embd: 64,
+        block_size: 32,
+        dropout: 0.0,
+    };
+    
+    let model = GptModel::<TestBackend>::new(&cfg, &device);
+    
+    let ids = Tensor::<TestBackend, 1, Int>::from_ints([1, 2, 3, 4], &device)
+        .reshape([1, 4]);
+    let logits = model.forward(ids, true);
+    
+    assert_eq!(logits.dims(), [1, 4, cfg.vocab_size], 
+                "Logits should be [B=1, T=4, V=128]");
+    assert!(GptModel::<TestBackend>::check_logits_health(&logits), 
+            "Logits should not contain NaN/Inf");
+}
+
+#[test]
+fn test_multi_batch_multi_block() {
+    let device = <TestBackend as Backend>::Device::default();
+    let cfg = NanoChatConfig {
+        sequence_len: 16,
+        vocab_size: 64,
+        n_layer: 3,
+        n_head: 4,
+        n_kv_head: 4,
+        n_embd: 32,
+        block_size: 16,
+        dropout: 0.0,
+    };
+    
+    let model = GptModel::<TestBackend>::new(&cfg, &device);
+    
+    // Batch of 3
+    let ids = Tensor::<TestBackend, 1, Int>::from_ints(
+        [1, 2, 3, 4, 5, 6], 
+        &device
+    ).reshape([3, 2]);
+    
+    let logits = model.forward(ids, true);
+    assert_eq!(logits.dims(), [3, 2, cfg.vocab_size]);
+}
+
+#[test]
+fn test_varying_sequence_lengths() {
+    let device = <TestBackend as Backend>::Device::default();
+    let cfg = NanoChatConfig {
+        sequence_len: 64,
+        vocab_size: 128,
+        n_layer: 2,
+        n_head: 4,
+        n_kv_head: 4,
+        n_embd: 64,
+        block_size: 64,
+        dropout: 0.0,
+    };
+    
+    let model = GptModel::<TestBackend>::new(&cfg, &device);
+    
+    // Test different sequence lengths
+    for seq_len in [1, 4, 8, 16] {
+        let ids = Tensor::<TestBackend, 1, Int>::from_ints(
+            vec![1; seq_len].as_slice(),
+            &device
+        ).reshape([1, seq_len]);
+        
+        let logits = model.forward(ids, true);
+        assert_eq!(logits.dims(), [1, seq_len, cfg.vocab_size]);
+    }
+}
+
+#[test]
+fn test_blocks_vector_size() {
+    let device = <TestBackend as Backend>::Device::default();
+    let cfg = NanoChatConfig {
+        sequence_len: 16,
+        vocab_size: 32,
+        n_layer: 5,  // Test with 5 layers
+        n_head: 2,
+        n_kv_head: 2,
+        n_embd: 32,
+        block_size: 16,
+        dropout: 0.0,
+    };
+    
+    let model = GptModel::<TestBackend>::new(&cfg, &device);
+    
+    // Verify forward works with 5 blocks
+    let ids = Tensor::<TestBackend, 1, Int>::from_ints([1, 2], &device)
+        .reshape([1, 2]);
+    let logits = model.forward(ids, true);
+    
+    assert_eq!(logits.dims(), [1, 2, 32]);
 }
