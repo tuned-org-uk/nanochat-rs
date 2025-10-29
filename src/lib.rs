@@ -12,6 +12,9 @@ pub mod gpt;
 pub mod tokenizer;
 pub mod sampling;
 pub mod engine;
+pub mod checkpoint;
+pub use checkpoint::{load_checkpoint, save_checkpoint, load_weights, save_weights};
+
 
 #[cfg(test)]
 mod tests;

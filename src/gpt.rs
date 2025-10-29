@@ -13,6 +13,7 @@ use burn::{
     tensor::{activation, backend::Backend, Bool, Int, Tensor},
 };
 use log::{debug, info, trace};
+use std::path::Path;
 
 use crate::config::NanoChatConfig;
 
@@ -712,5 +713,22 @@ impl<B: Backend> GptModel<B> {
         logits = logits.clamp(-50.0, 50.0);
 
         logits
+    }
+
+    /// Save this model and its config to a checkpoint directory
+    pub fn save_checkpoint(
+        &self,
+        config: &NanoChatConfig,
+        checkpoint_dir: impl AsRef<Path>,
+    ) -> anyhow::Result<()> {
+        crate::checkpoint::save_checkpoint(self, config, checkpoint_dir)
+    }
+
+    /// Load a model from checkpoint directory
+    pub fn load_checkpoint(
+        checkpoint_dir: impl AsRef<Path>,
+        device: &B::Device,
+    ) -> anyhow::Result<(Self, NanoChatConfig)> {
+        crate::checkpoint::load_checkpoint(checkpoint_dir, device)
     }
 }

@@ -4,7 +4,7 @@
 //!
 //! Returns token IDs as [B, 1] shaped tensors for consistent batch handling
 
-use burn::tensor::{activation, backend::Backend, Bool, Int, Tensor};
+use burn::tensor::{activation, backend::Backend, Bool, Int, Tensor, TensorData};
 use log::debug;
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -60,7 +60,9 @@ pub fn top_p_filter<B: Backend>(logits: Tensor<B, 2>, p: f64) -> Tensor<B, 2> {
 
     let probs = activation::softmax(logits.clone(), 1);
     let probs_host: Vec<f32> = probs.to_data().to_vec().unwrap();
-    let mut keep_mask: Vec<f32> = vec![0.0; batch * vocab];
+    
+    // Build keep mask as bools directly
+    let mut keep_mask_bool: Vec<bool> = vec![false; batch * vocab];
 
     for b in 0..batch {
         let mut pairs: Vec<(f32, usize)> = (0..vocab)
@@ -71,7 +73,7 @@ pub fn top_p_filter<B: Backend>(logits: Tensor<B, 2>, p: f64) -> Tensor<B, 2> {
         let mut cum = 0.0f32;
         for (prob, idx) in pairs {
             if cum < p as f32 {
-                keep_mask[b * vocab + idx] = 1.0;
+                keep_mask_bool[b * vocab + idx] = true;
                 cum += prob;
             } else {
                 break;
@@ -79,15 +81,9 @@ pub fn top_p_filter<B: Backend>(logits: Tensor<B, 2>, p: f64) -> Tensor<B, 2> {
         }
     }
 
-    let keep_mask_tensor =
-        Tensor::<B, 2>::from_floats(keep_mask.as_slice(), &probs.device()).reshape([batch, vocab]);
-    
-    // Create threshold tensor - pass ownership via as_slice()
-    let threshold_data = vec![0.5; batch * vocab];
-    let threshold = Tensor::<B, 2>::from_floats(threshold_data.as_slice(), &probs.device())
-        .reshape([batch, vocab]);
-    
-    let keep_bool: Tensor<B, 2, Bool> = keep_mask_tensor.greater(threshold);
+    // Create bool mask directly without comparison
+    let keep_mask_data = TensorData::new(keep_mask_bool, [batch, vocab]);
+    let keep_bool = Tensor::<B, 2, Bool>::from_data(keep_mask_data, &probs.device());
 
     logits.mask_fill(keep_bool.bool_not(), f64::NEG_INFINITY)
 }
@@ -99,7 +95,7 @@ pub fn top_p_filter<B: Backend>(logits: Tensor<B, 2>, p: f64) -> Tensor<B, 2> {
 /// Greedy sampling: argmax on vocab dimension
 /// Input: [B, V], Output: [B, 1] Int
 pub fn sample_greedy<B: Backend>(logits: Tensor<B, 2>) -> Tensor<B, 2, Int> {
-    let [b, _v] = logits.dims();
+    let [_b, _v] = logits.dims();
     // argmax(1) keeps dim by default in Burn, resulting in [B, 1]
     let indices = logits.argmax(1);
     debug!("Greedy sample output shape: {:?}", indices.dims());

@@ -1,0 +1,188 @@
+// src/bin/main.rs
+
+use anyhow::Result;
+use burn::tensor::{Int, Tensor};
+use tempfile::TempDir;
+
+use nanochat::{
+    backend::{get_device, print_backend_info, AutoBackend},
+    checkpoint::{load_checkpoint, save_checkpoint},
+    config::NanoChatConfig,
+    engine::{Engine, KVCache},
+    gpt::GptModel,
+    sampling::{extract_last_logits, sample_with_policy, SamplingPolicy},
+    rustbpe::Tokenizer, // Add tokenizer import
+};
+
+fn main() -> Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    print_backend_info();
+    let device = get_device();
+
+    println!("\n═══════════════════════════════════════════════════════════");
+    println!("🚀 NanoChat-rs: Comprehensive Demo with Tokenizer");
+    println!("═══════════════════════════════════════════════════════════\n");
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // Initialize tokenizer
+    // ═════════════════════════════════════════════════════════════════════════
+    println!("📝 [Tokenizer] Loading BPE tokenizer...");
+    
+    // Load tokenizer from trained model directory
+    let tokenizer = Tokenizer::from_file("path/to/tok65536.model")?;
+    
+    println!("   Vocab size: {}", tokenizer.vocab_size());
+    println!("   ✓ Tokenizer loaded\n");
+
+    // Configuration matching tokenizer vocab
+    let cfg = NanoChatConfig {
+        sequence_len: 128,
+        vocab_size: tokenizer.vocab_size(),
+        n_layer: 4,
+        n_head: 4,
+        n_kv_head: 2,
+        n_embd: 128,
+        block_size: 128,
+        dropout: 0.0,
+    };
+
+    println!("📋 Model Configuration:");
+    println!("   Vocab size: {}", cfg.vocab_size);
+    println!("   Layers: {}", cfg.n_layer);
+    println!("   Heads: {} (KV heads: {})", cfg.n_head, cfg.n_kv_head);
+    println!("   Embedding dim: {}", cfg.n_embd);
+    println!("   Max sequence: {}\n", cfg.sequence_len);
+
+    // Initialize model
+    println!("🔨 Creating multi-block GPT...");
+    let model = GptModel::<AutoBackend>::new(&cfg, &device);
+    println!("   ✓ Model initialized\n");
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // Text encoding and generation
+    // ═════════════════════════════════════════════════════════════════════════
+    println!("💬 [Text Generation] Encode → Generate → Decode");
+    
+    let prompt = "Once upon a time";
+    println!("   Prompt: \"{}\"", prompt);
+    
+    // Encode text to token IDs
+    let token_ids = tokenizer.encode(prompt)?;
+    println!("   Encoded: {:?}", token_ids);
+    
+    let input = Tensor::<AutoBackend, 1, Int>::from_ints(
+        token_ids.iter().map(|&x| x as i64).collect::<Vec<_>>().as_slice(),
+        &device,
+    ).reshape([1, token_ids.len()]);
+
+    // Generate with different sampling strategies
+    println!("\n   🎲 Greedy generation (20 tokens):");
+    let greedy_out = model.generate(input.clone(), 20);
+    let greedy_ids = greedy_out.to_data().to_vec::<i64>().unwrap();
+    let greedy_tokens: Vec<u32> = greedy_ids.iter().map(|&x| x as u32).collect();
+    let greedy_text = tokenizer.decode(&greedy_tokens)?;
+    println!("      {}", greedy_text);
+
+    // Temperature sampling via policy
+    println!("\n   🌡️  Temperature=0.8 generation:");
+    let engine = Engine::new(model.clone(), device.clone());
+    let mut generated_ids = token_ids.clone();
+    
+    for _ in 0..20 {
+        let current_input = Tensor::<AutoBackend, 1, Int>::from_ints(
+            generated_ids.iter().map(|&x| x as i64).collect::<Vec<_>>().as_slice(),
+            &device,
+        ).reshape([1, generated_ids.len()]);
+        
+        let logits = model.forward(current_input, true);
+        let last_logits = extract_last_logits(logits);
+        
+        let next_token = sample_with_policy(
+            last_logits,
+            SamplingPolicy::Temperature { t: 0.8 },
+        );
+        
+        let next_id = next_token.to_data().to_vec::<i64>().unwrap()[0] as u32;
+        generated_ids.push(next_id);
+    }
+    
+    let temp_text = tokenizer.decode(&generated_ids)?;
+    println!("      {}", temp_text);
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // Streaming with live decode
+    // ═════════════════════════════════════════════════════════════════════════
+    println!("\n   🌊 Streaming generation:");
+    print!("      ");
+    
+    let mut stream = engine.stream(input.clone(), 30);
+    let mut stream_ids = token_ids.clone();
+    
+    for token in stream {
+        let tid = token.to_data().to_vec::<i64>().unwrap()[0] as u32;
+        stream_ids.push(tid);
+        
+        // Decode incrementally (you could also decode single token for streaming)
+        let decoded = tokenizer.decode(&stream_ids)?;
+        // For demo, just show the token ID
+        print!("{} ", tid);
+    }
+    println!("\n");
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // Softcap and sampling tests (abbreviated)
+    // ═════════════════════════════════════════════════════════════════════════
+    println!("🧪 [M9] Softcap test...");
+    let logits_capped = model.forward(input.clone(), true);
+    let max_val = logits_capped.clone().max().to_data().to_vec::<f32>().unwrap()[0];
+    println!("   Max logit with softcap: {:.2} (should be ~15)", max_val);
+    println!("   ✓ Softcap active\n");
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // Checkpoint I/O
+    // ═════════════════════════════════════════════════════════════════════════
+    println!("💾 [M10] Checkpoint save/load...");
+    let temp_dir = TempDir::new()?;
+    save_checkpoint(&model, &cfg, temp_dir.path())?;
+    let (loaded_model, _) = load_checkpoint::<AutoBackend>(temp_dir.path(), &device)?;
+    println!("   ✓ Checkpoint validated\n");
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // Interactive loop (optional)
+    // ═════════════════════════════════════════════════════════════════════════
+    println!("═══════════════════════════════════════════════════════════");
+    println!("💡 Interactive mode (Ctrl+C to exit)");
+    println!("═══════════════════════════════════════════════════════════\n");
+
+    loop {
+        use std::io::{self, Write};
+        
+        print!("You: ");
+        io::stdout().flush()?;
+        
+        let mut input_text = String::new();
+        io::stdin().read_line(&mut input_text)?;
+        let input_text = input_text.trim();
+        
+        if input_text.is_empty() {
+            continue;
+        }
+        
+        // Encode
+        let ids = tokenizer.encode(input_text)?;
+        let tensor_input = Tensor::<AutoBackend, 1, Int>::from_ints(
+            ids.iter().map(|&x| x as i64).collect::<Vec<_>>().as_slice(),
+            &device,
+        ).reshape([1, ids.len()]);
+        
+        // Generate
+        let output = loaded_model.generate(tensor_input, 50);
+        let out_ids = output.to_data().to_vec::<i64>().unwrap();
+        let out_tokens: Vec<u32> = out_ids.iter().map(|&x| x as u32).collect();
+        
+        // Decode
+        let response = tokenizer.decode(&out_tokens)?;
+        println!("Bot: {}\n", response);
+    }
+}

@@ -1,4 +1,3 @@
-// src/bin/minimal.rs
 use anyhow::Result;
 use burn::tensor::{Int, Tensor};
 
