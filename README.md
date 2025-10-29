@@ -34,6 +34,62 @@ nanochat-rs implements a decoder-only transformer with state-of-the-art features
 - **Softcap Logits**: Bounds output logits using tanh(x/15)*15 to prevent extreme values
 
 
+## Building
+
+```bash
+# CPU only (fast compile)
+cargo build --release
+
+# GPU with WGPU
+cargo build --release --features wgpu
+
+# NVIDIA with CUDA
+cargo build --release --features cuda
+```
+
+
+## Testing
+
+```bash
+# Unit tests
+cargo test
+
+# Integration test with demo
+cargo run --release --bin main
+```
+
+## Technical Details
+
+**Attention Mechanism**:
+
+- Scaled dot-product with sqrt(d_k) normalization
+- Causal masking via tril_mask with large-negative fill (-1e9)
+- Max-subtraction per row before softmax for numerical stability
+- MQA: KV heads repeated via unsqueeze/expand to match Q heads
+
+**Forward Pass Flow**:
+
+```
+Input IDs [B,T] 
+→ Embedding [B,T,C]
+→ N × Block(RMSNorm → Attn+Residual → RMSNorm → MLP+Residual)
+→ Final RMSNorm [B,T,C]
+→ LM Head [B,T,V]
+→ Softcap + Clamp
+→ Logits [B,T,V]
+```
+
+**Decode Flow** (with cache):
+
+```
+Last Token [B,1]
+→ Embed [B,1,C]
+→ N × Block(decode with cache update)
+→ Final RMSNorm [B,1,C]
+→ LM Head [B,1,V]
+→ Sample next token
+```
+
 ### Key Features by Milestone
 
 **M2: Sampling Policies**
