@@ -11,7 +11,7 @@ use nanochat::{
     engine::{Engine, KVCache},
     gpt::GptModel,
     sampling::{extract_last_logits, sample_with_policy, SamplingPolicy},
-    rustbpe::Tokenizer, // Add tokenizer import
+    bpe_tokenizer::Tokenizer, // Add tokenizer import
 };
 
 fn main() -> Result<()> {
